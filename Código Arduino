@@ -1,0 +1,310 @@
+#include <Arduino.h>
+
+// =======================
+// PINOS ORIGINAIS
+// =======================
+const int PIN_LASER = 12;
+const int PIN_LDR = A0;
+
+// =======================
+// TEMPOS DA TRANSMISSÃO
+// =======================
+const int PULSO_INICIO = 1200;
+const int PULSO_FIM = 2000;
+
+const int BIT_0 = 200;
+const int BIT_1 = 600;
+
+const int INTERVALO = 200;
+
+// =======================
+// LDR
+// =======================
+int limiarLDR = 650;
+bool laserMaiorQueAmbiente = true;
+
+// =======================
+// TRANSMISSOR
+// =======================
+String mensagemTx = "";
+
+int indiceCharTx = 0;
+int indiceBitTx = 0;
+
+bool transmitindo = false;
+
+enum EstadoTx {
+  TX_PARADO,
+  TX_INICIO,
+  TX_INTERVALO_INICIO,
+  TX_BIT,
+  TX_INTERVALO_BIT,
+  TX_FIM
+};
+
+EstadoTx estadoTx = TX_PARADO;
+
+unsigned long tempoTx = 0;
+int duracaoTx = 0;
+
+// =======================
+// RECEPTOR
+// =======================
+bool estadoLuzAnterior = false;
+unsigned long inicioPulsoRx = 0;
+
+bool recebendo = false;
+
+byte byteRecebido = 0;
+int indiceBitRx = 0;
+
+String mensagemRx = "";
+
+// =======================
+// FUNÇÕES DO LDR
+// =======================
+int mediaLDR() {
+  long soma = 0;
+
+  for (int i = 0; i < 20; i++) {
+    soma += analogRead(PIN_LDR);
+    delay(10);
+  }
+
+  return soma / 20;
+}
+
+bool laserDetectado() {
+  int leitura = analogRead(PIN_LDR);
+
+  if (laserMaiorQueAmbiente) {
+    return leitura > limiarLDR;
+  } else {
+    return leitura < limiarLDR;
+  }
+}
+
+void calibrarLDR() {
+  digitalWrite(PIN_LASER, LOW);
+  delay(500);
+  int valorSemLaser = mediaLDR();
+
+  digitalWrite(PIN_LASER, HIGH);
+  delay(500);
+  int valorComLaser = mediaLDR();
+
+  digitalWrite(PIN_LASER, LOW);
+
+  limiarLDR = (valorSemLaser + valorComLaser) / 2;
+  laserMaiorQueAmbiente = valorComLaser > valorSemLaser;
+
+  Serial.println("Calibracao do LDR:");
+  Serial.print("Sem laser: ");
+  Serial.println(valorSemLaser);
+
+  Serial.print("Com laser: ");
+  Serial.println(valorComLaser);
+
+  Serial.print("Limiar usado: ");
+  Serial.println(limiarLDR);
+
+  if (abs(valorComLaser - valorSemLaser) < 50) {
+    Serial.println("ATENCAO: pouca diferenca entre claro e escuro.");
+    Serial.println("Aponte melhor o laser para o LDR.");
+  }
+
+  Serial.println();
+}
+
+// =======================
+// TRANSMISSÃO
+// =======================
+void ligarLaser() {
+  digitalWrite(PIN_LASER, HIGH);
+}
+
+void desligarLaser() {
+  digitalWrite(PIN_LASER, LOW);
+}
+
+void iniciarPulsoTx(int duracao, EstadoTx novoEstado) {
+  ligarLaser();
+  tempoTx = millis();
+  duracaoTx = duracao;
+  estadoTx = novoEstado;
+}
+
+void iniciarIntervaloTx(EstadoTx novoEstado) {
+  desligarLaser();
+  tempoTx = millis();
+  duracaoTx = INTERVALO;
+  estadoTx = novoEstado;
+}
+
+void iniciarTransmissao(String texto) {
+  mensagemTx = texto;
+  indiceCharTx = 0;
+  indiceBitTx = 0;
+  transmitindo = true;
+
+  Serial.print("Mensagem enviada: ");
+  Serial.println(mensagemTx);
+
+  iniciarPulsoTx(PULSO_INICIO, TX_INICIO);
+}
+
+void gerenciarTransmissao() {
+  if (!transmitindo) return;
+
+  if (millis() - tempoTx < duracaoTx) return;
+
+  if (estadoTx == TX_INICIO) {
+    iniciarIntervaloTx(TX_INTERVALO_INICIO);
+  }
+
+  else if (estadoTx == TX_INTERVALO_INICIO) {
+    indiceCharTx = 0;
+    indiceBitTx = 0;
+
+    char caractere = mensagemTx[indiceCharTx];
+    int bitAtual = bitRead(caractere, indiceBitTx);
+
+    if (bitAtual == 0) {
+      iniciarPulsoTx(BIT_0, TX_BIT);
+    } else {
+      iniciarPulsoTx(BIT_1, TX_BIT);
+    }
+  }
+
+  else if (estadoTx == TX_BIT) {
+    iniciarIntervaloTx(TX_INTERVALO_BIT);
+  }
+
+  else if (estadoTx == TX_INTERVALO_BIT) {
+    indiceBitTx++;
+
+    if (indiceBitTx >= 8) {
+      indiceBitTx = 0;
+      indiceCharTx++;
+    }
+
+    if (indiceCharTx >= mensagemTx.length()) {
+      iniciarPulsoTx(PULSO_FIM, TX_FIM);
+    } else {
+      char caractere = mensagemTx[indiceCharTx];
+      int bitAtual = bitRead(caractere, indiceBitTx);
+
+      if (bitAtual == 0) {
+        iniciarPulsoTx(BIT_0, TX_BIT);
+      } else {
+        iniciarPulsoTx(BIT_1, TX_BIT);
+      }
+    }
+  }
+
+  else if (estadoTx == TX_FIM) {
+    desligarLaser();
+
+    transmitindo = false;
+    estadoTx = TX_PARADO;
+
+    Serial.println("Transmissao finalizada.");
+    Serial.println();
+  }
+}
+
+// =======================
+// RECEPÇÃO
+// =======================
+void processarBitRecebido(int bitRecebido) {
+  bitWrite(byteRecebido, indiceBitRx, bitRecebido);
+  indiceBitRx++;
+
+  if (indiceBitRx >= 8) {
+    mensagemRx += char(byteRecebido);
+
+    byteRecebido = 0;
+    indiceBitRx = 0;
+  }
+}
+
+void gerenciarRecepcao() {
+  bool luzAtual = laserDetectado();
+
+  if (luzAtual && !estadoLuzAnterior) {
+    inicioPulsoRx = millis();
+  }
+
+  if (!luzAtual && estadoLuzAnterior) {
+    unsigned long duracaoPulso = millis() - inicioPulsoRx;
+
+    if (duracaoPulso >= 900 && duracaoPulso <= 1500) {
+      recebendo = true;
+      mensagemRx = "";
+      byteRecebido = 0;
+      indiceBitRx = 0;
+
+      Serial.println("Inicio da transmissao detectado.");
+    }
+
+    else if (recebendo && duracaoPulso >= 1700) {
+      Serial.print("Mensagem recebida: ");
+      Serial.println(mensagemRx);
+
+      recebendo = false;
+      mensagemRx = "";
+      byteRecebido = 0;
+      indiceBitRx = 0;
+    }
+
+    else if (recebendo) {
+      if (duracaoPulso >= 100 && duracaoPulso <= 350) {
+        processarBitRecebido(0);
+      }
+
+      else if (duracaoPulso >= 450 && duracaoPulso <= 750) {
+        processarBitRecebido(1);
+      }
+    }
+  }
+
+  estadoLuzAnterior = luzAtual;
+}
+
+// =======================
+// SETUP
+// =======================
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(PIN_LASER, OUTPUT);
+  pinMode(PIN_LDR, INPUT);
+
+  desligarLaser();
+
+  Serial.println("Sistema de transmissao por laser iniciado.");
+  Serial.println("Usando Laser no pino 12 e LDR no A0.");
+  Serial.println();
+
+  calibrarLDR();
+
+  Serial.println("Digite uma mensagem no Monitor Serial:");
+  Serial.println();
+}
+
+// =======================
+// LOOP
+// =======================
+void loop() {
+  if (Serial.available() > 0 && !transmitindo) {
+    String texto = Serial.readStringUntil('\n');
+    texto.trim();
+
+    if (texto.length() > 0) {
+      iniciarTransmissao(texto);
+    }
+  }
+
+  gerenciarTransmissao();
+  gerenciarRecepcao();
+}
